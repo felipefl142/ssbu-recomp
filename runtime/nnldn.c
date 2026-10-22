@@ -426,11 +426,19 @@ static void scan(Ctx *c, uint64_t out, uint64_t count_p, int32_t room, uint64_t 
 }
 static void ldn_Scan(Ctx *c) { scan(c, c->x[0], c->x[1], (int32_t)c->x[2], c->x[3]); }
 
-static void join(Ctx *c, const uint8_t *session, uint64_t user, uint16_t version) {
+/* hinted: the host named by the NetworkInfo the game passes (Connect), asked even when its room is missing from the rooms
+ * seen. Seen once (a public room, 2026-10-21): after a match the game left the room and called Connect again with it while
+ * the lobby's last list did not have it; the join was refused at once and the game showed error 2618-0006. Whether the
+ * list was only late or the room really gone is not known (inferred); a host that is gone does not answer (5 tries). */
+static void join(Ctx *c, const uint8_t *session, uint64_t user, uint16_t version, uint32_t hinted) {
     AcquireSRWLockExclusive(&L.lock);
     uint32_t host = 0;
     for (int i = 0; i < SEEN_MAX && !host; i++)
         if (L.seen[i].at && !memcmp(L.seen[i].info + NI_SESSION, session, 16)) host = u32at(L.seen[i].info + NODE(0));
+    if (!host && (hinted & VNET_MASK) == VNET_SUBNET && hinted != net_my_ip()) {
+        host = hinted;
+        if (LOGL(1)) printf("[online] ldn: room not in the last list: asking its host directly\n");
+    }
     char why[256];
     if (host && net_room_refusal(host, why, sizeof why)) {     /* O1: a room of another version or mod set: listed, never joined */
         ReleaseSRWLockExclusive(&L.lock);
@@ -466,9 +474,9 @@ static void join(Ctx *c, const uint8_t *session, uint64_t user, uint16_t version
     RET(ok ? 0 : R_LDN_NONET);
 }
 /* Connect(const NetworkInfo &, const SecurityConfig &, const UserConfig &, int version, ConnectOption) */
-static void ldn_Connect(Ctx *c) { join(c, PTR(c->x[0] + NI_SESSION), c->x[2], (uint16_t)c->x[3]); }
+static void ldn_Connect(Ctx *c) { join(c, PTR(c->x[0] + NI_SESSION), c->x[2], (uint16_t)c->x[3], u32at(PTR(c->x[0] + NODE(0)))); }
 /* ConnectPrivate(const NetworkConfig &, const SecurityConfig &, const SecurityParameter &, const UserConfig &, int, ConnectOption) */
-static void ldn_ConnectPrivate(Ctx *c) { join(c, PTR(c->x[2] + 16), c->x[3], (uint16_t)c->x[4]); }
+static void ldn_ConnectPrivate(Ctx *c) { join(c, PTR(c->x[2] + 16), c->x[3], (uint16_t)c->x[4], 0); }
 static void ldn_Disconnect(Ctx *c) {
     AcquireSRWLockExclusive(&L.lock);
     if (L.state == LS_STA_CONNECTED) {

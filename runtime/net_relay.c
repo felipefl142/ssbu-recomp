@@ -48,7 +48,8 @@
  *   SSBU_ONLINE_NAME                 online_name                      name in the lobby's log (default Player-xxxx)
  *   SSBU_ONLINE_CODE                 online_code                      lobby code: only players with the same code meet
  *   SSBU_ONLINE_DIRECT=0             online_direct = off              no direct paths: everything through the lobby
- *   SSBU_ONLINE_PORT=<n>             local UDP port (default: any)
+ *   SSBU_ONLINE_PORT=<n>             online_local_port                local UDP port (default: any): a fixed port lets a firewall
+ *                                                                    that drops unasked-for UDP (Linux ufw) be opened for direct paths
  *   SSBU_ONLINE_LOG=0..3             log level (default 1)
  *   SSBU_ONLINE_BUILD                build id override (players of different builds never meet) */
 #include <winsock2.h>
@@ -329,6 +330,7 @@ static void configure(void) {
     if ((e = getenv("SSBU_ONLINE_DIRECT"))) g_direct = !is_off(e);
     else if (ini_value("online_direct", v, sizeof v)) g_direct = !is_off(v);
     if ((e = getenv("SSBU_ONLINE_PORT")) && atoi(e) > 0 && atoi(e) < 65536) g_local_port = (uint16_t)atoi(e);
+    else if (ini_value("online_local_port", v, sizeof v) && atoi(v) > 0 && atoi(v) < 65536) g_local_port = (uint16_t)atoi(v);
     if ((e = getenv("SSBU_ONLINE_LOG"))) g_log = atoi(e);
     mods_scan();                       /* O1: the mods this game loads (their names and hashes go to the lobby) */
     if ((e = getenv("SSBU_ONLINE_BUILD")) && *e) snprintf(g_build, sizeof g_build, "%s", e);
@@ -1110,7 +1112,11 @@ static void bind_client(int loopback_only) {    /* (client thread) binds g_sock;
     a.sin_family = AF_INET;
     a.sin_port = htons(g_local_port);
     a.sin_addr.s_addr = loopback_only ? htonl(INADDR_LOOPBACK) : INADDR_ANY;
-    if (bind(g_sock, (struct sockaddr *)&a, sizeof a)) say("cannot bind UDP port %u (error %d)", g_local_port, WSAGetLastError());
+    if (bind(g_sock, (struct sockaddr *)&a, sizeof a)) {
+        say("cannot bind UDP port %u (error %d)%s", g_local_port, WSAGetLastError(), g_local_port ? ": any port instead" : "");
+        a.sin_port = 0;                              /* (in use, e.g. by a second copy of the game: still online) */
+        if (g_local_port) bind(g_sock, (struct sockaddr *)&a, sizeof a);
+    }
     int len = sizeof a;
     if (!getsockname(g_sock, (struct sockaddr *)&a, &len)) g_lan_port = ntohs(a.sin_port);
     g_lan_ip = loopback_only ? INADDR_LOOPBACK : outbound_ip();
@@ -1572,6 +1578,8 @@ void net_start(void) {
  *   players  in this player's Local Wireless room (this PC included); 1 while in the lobby but in no room
  *   ping_ms  round trip to the other player of the room: the direct path's last hello answer when the path is direct,
  *            otherwise the round trip to the lobby (relayed: the lobby is in between); -1 = unknown
+ *   ping_to  which of the two ping_ms is (NET_PING_DIRECT / NET_PING_LOBBY), NET_PING_ROLLBACK in a rollback match
+ *   peers, direct  the room's other players, and how many of them are reached directly (fresh direct path)
  *   delay, rollback_*  0: the game's own Local Wireless netcode is delay based and is not ours to measure (rollback, N1). */
 void net_stats_get(NetStats *o) {
     memset(o, 0, sizeof *o);
@@ -1581,14 +1589,17 @@ void net_stats_get(NetStats *o) {
     o->state = NET_CONNECTED;
     {   /* R3: an online rollback match (rb_net.c / rb_rollback.c) fills delay and rollback; its own round trip */
         int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk);
-        if (rbn_started()) { rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); return; }
+        if (rbn_started()) { rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); o->ping_to = NET_PING_ROLLBACK; return; }
     }
     int in_room = nnldn_players();
     o->players = in_room ? in_room : 1;
     o->ping_ms = (int)g_ping;
     if (in_room > 1 && TryAcquireSRWLockShared(&g_peers_lock)) {
         uint64_t t = ms_now();
-        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) { o->ping_ms = g_peers[i].rtt; break; }
+        o->peers = g_npeers;
+        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) {
+            if (!o->direct++) { o->ping_ms = g_peers[i].rtt; o->ping_to = NET_PING_DIRECT; }
+        }
         ReleaseSRWLockShared(&g_peers_lock);
     }
 }
