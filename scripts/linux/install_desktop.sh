@@ -21,10 +21,13 @@ fi
 [ -x "$REPO/deps/venv/bin/python" ] || { echo "deps/venv is missing: run scripts/linux/install_deps.sh first" >&2; exit 1; }
 
 mkdir -p "$APPS" "$DATA"
+# CachyOS: game-performance holds the "performance" power profile (and inhibits the screensaver) while the game runs
+WRAP=""
+command -v game-performance >/dev/null && WRAP="game-performance "
 # a small launcher script, so that the desktop entry holds no quoting of paths with spaces
 cat > "$DATA/launch.sh" <<EOF
 #!/bin/sh
-exec "$REPO/deps/venv/bin/python" "$REPO/scripts/run.py" --linux --log "$DATA/last_run.log" "\$@"
+exec ${WRAP}"$REPO/deps/venv/bin/python" "$REPO/scripts/run.py" --linux --log "$DATA/last_run.log" "\$@"
 EOF
 chmod +x "$DATA/launch.sh"
 cat > "$ENTRY" <<EOF
