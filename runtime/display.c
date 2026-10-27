@@ -476,11 +476,11 @@ static void la_note(const char *note) { (void)note; }
 int oe_exit_request(void);                            /* nnmisc.c */
 static char g_title[96];
 static volatile LONG g_mon_dirty = 1;                 /* a monitor was connected or removed: the window thread reads the list again */
-static volatile LONG g_mon_moved = 1;                 /* the window went to another monitor: logged by the window thread */
+static volatile LONG g_mon_moved;                     /* the monitor the window went to (an SDL_DisplayID; 0 = none since the last look) */
 static bool SDLCALL close_watch(void *user, SDL_Event *e) {
     (void)user;
     if (e->type == SDL_EVENT_DISPLAY_ADDED || e->type == SDL_EVENT_DISPLAY_REMOVED) InterlockedExchange(&g_mon_dirty, 1);
-    if (e->type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) InterlockedExchange(&g_mon_moved, 1);
+    if (e->type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) InterlockedExchange(&g_mon_moved, (LONG)e->window.data1);
     if (e->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED || e->type == SDL_EVENT_QUIT) {
         static volatile LONG once;
         if (InterlockedExchange(&once, 1)) return true;
@@ -496,6 +496,7 @@ static bool SDLCALL close_watch(void *user, SDL_Event *e) {
 #define MON_MAX 8
 static struct { SDL_DisplayID id; char name[80]; int w, h; } g_mon[MON_MAX];
 static int g_mon_n, g_mon_primary, g_mon_cur = -1;     /* g_mon_cur: the monitor the window was put on */
+static int g_mon_seen, g_mon_fix;                     /* the window was on g_mon_cur once; moves back made so far */
 static SRWLOCK g_mon_lock = SRWLOCK_INIT;
 static volatile LONG g_mon_req = -2;                  /* the menu's choice: -2 none, -1 auto, n = g_mon[n] */
 static char g_mon_want[96];                           /* "" = auto (the primary monitor), else as graphics.ini monitor */
@@ -583,15 +584,26 @@ static void window_mode_service(SDL_Window *w) {
         printf("display: window mode %s (settings menu)\n", m == 2 ? "fullscreen" : m ? "borderless" : "windowed"); fflush(stdout);
     }
     if (InterlockedExchange(&g_mon_dirty, 0)) monitors_read();
-    if (InterlockedExchange(&g_mon_moved, 0)) {
-        SDL_DisplayID id = SDL_GetDisplayForWindow(w);
-        const char *nm = id ? SDL_GetDisplayName(id) : NULL;
+    {   /* GNOME places the window when its first frame arrives (after the shader loading: up to a minute on the first
+         * start), on the monitor with the pointer or the focus, whatever output SDL asked for: until the window has been on
+         * the chosen monitor once, it is moved back there (at most 3 times; a later move by the person stays) */
+        SDL_DisplayID on = (SDL_DisplayID)InterlockedExchange(&g_mon_moved, 0);
+        const char *nm = on ? SDL_GetDisplayName(on) : NULL;
         if (nm) { printf("display: the window is on %s\n", nm); fflush(stdout); }
+        if (on && g_mon_cur >= 0 && g_mon_cur < g_mon_n) {
+            if (on == g_mon[g_mon_cur].id) g_mon_seen = 1;
+            else if (!g_mon_seen && g_mon_fix < 3) {
+                g_mon_fix++;
+                printf("display: the desktop put the window on %s, not on the chosen monitor: moved back\n", nm ? nm : "another monitor"); fflush(stdout);
+                monitor_place(w, g_mon_cur, (int)g_mode_now);
+            }
+        }
     }
     LONG mi = InterlockedExchange(&g_mon_req, -2);
     if (mi >= -1) {
         g_mon_want[0] = 0;
         if (mi >= 0 && mi < g_mon_n) snprintf(g_mon_want, sizeof g_mon_want, "%s", g_mon[mi].name);
+        g_mon_seen = 0; g_mon_fix = 0;
         monitor_place(w, monitor_pick(g_mon_want), (int)g_mode_now);
     }
     if (InterlockedExchange(&g_size_req, 0)) {
