@@ -1828,9 +1828,13 @@ static void ra_init(void) {
     int l = hook_install_name("_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv", ra_line, NULL, &g_orig_line);
     LOG("r1: RUN-AHEAD on (one frame): marks %s; save point: the return of the job-counter wait 710354c720 called at 710374c028 (preparation done, before the render kick): %s; frame line counter: %s; park %.1f ms\n",
         g_mark > 0 ? "yes" : "NO (run-ahead will stay off)", k ? "installed" : "FAILED", l ? "installed or waiting" : "FAILED", g_ra_park_ms);
-    if (rgs_wanted() && rbg_on()) {                       /* R3: re-run passes but the last skip the preparation kicks + lists (49) and the presentation callees (127), proven exact in R2 round 3 */
+    if (rgs_wanted() && rbg_on()) {                       /* R3: re-run passes but the last skip the preparation kicks + lists (49) and the presentation callees but the lighting (123), proven exact in R2 round 3 */
         g_rgs_skip = getenv("SSBU_RB_SIM_SKIP") ? atoi(getenv("SSBU_RB_SIM_SKIP")) : 49;
-        if (!getenv("SSBU_RB_SIM_LITE")) _putenv("SSBU_RB_SIM_LITE=127");
+        /* (2026-10-27) not group 4 (lighting): the simulation stays exact without it, but the picture does not. Skipped in the
+         * re-run passes, the fighters kept a coloured glow for the rest of the match (red, green, blue; seen in 6 of 7 matches
+         * that skipped it, the seventh unclear; 0 of 4 that ran it), and running it costs nothing measurable (re-run pass 2.5-2.8 ms,
+         * 3.1 with it skipped) */
+        if (!getenv("SSBU_RB_SIM_LITE")) _putenv("SSBU_RB_SIM_LITE=123");
         rbn_init();
         LOG("r1: RB NET on (R3 online rollback on the snapshot ring): kick skip mask in re-run passes %d\n", g_rgs_skip);
         rgs_lite_init(); }
