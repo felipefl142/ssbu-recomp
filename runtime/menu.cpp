@@ -1074,10 +1074,10 @@ static void sec_experimental(void) {
         static int rb_have = -1, rb_on = -1, rb_on0;
         if (rb_have < 0) {
             char v[16];
-#ifdef _WIN32
-            rb_have = 1;
-#else
+#ifdef __APPLE__
             rb_have = 0;
+#else
+            rb_have = 1;
 #endif
             rb_on = ini_read("rollback", v, sizeof v) && !off_word(v); rb_on0 = rb_on;
         }
@@ -1086,7 +1086,7 @@ static void sec_experimental(void) {
         tag(1, rb_on != rb_on0);
         ImGui::SameLine();
         if (rb_have) ImGui::TextDisabled("smooth online fights at high ping (experimental); both players need it on");
-        else ImGui::TextDisabled("not in the Linux / macOS build yet");
+        else ImGui::TextDisabled("not in the macOS build yet");
         if (getenv("SSBU_RB_NET")) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "Rollback is active in this run (SSBU_RB_NET=%s).", getenv("SSBU_RB_NET"));
         sec_online();
     }

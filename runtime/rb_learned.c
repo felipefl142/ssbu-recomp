@@ -35,6 +35,11 @@
  *   ls_capture / ls_each instead of rg_sweep when g_ls_active, ls_capture_end; r1_ring_rebase -> ls_rebase(); rgs_step (fight
  *   over) -> ls_fight_off(); r1_on_commit / r1_on_decommit / r1_wrote -> ls_range; ra_init: g_mark = mark_bind() || ls_bind();
  *   r1_init -> ls_init(); collect() -> ls_pool_meta; rgs_report -> ls_report(). */
+#ifdef _WIN32
+#define LS_VP(p, n, prot, old) VirtualProtect((p), (n), (prot), (old))
+#else       /* Linux: to the kernel alone (plat_posix.c plat_protect_raw); the bookkeeping keeps these pages read-write */
+#define LS_VP(p, n, prot, old) ((void)(old), plat_protect_raw((p), (n), (prot)))
+#endif
 static int g_ls_on = -1, g_ls_active, g_ls_cmp, g_ls_off_done;
 static volatile uint8_t *g_ls_st;                       /* per ring page id (windows 1 + 2): 0 untracked, 1 read-only, 2 learned, 3 opening */
 static size_t g_ls_n1, g_ls_np;
@@ -80,14 +85,26 @@ static void ls_push(size_t id) {                         /* (shared: SSBU_LS_DEC
     if (k < g_ls_cap) { g_ls_lc[k] = (uint32_t)g_ls_caps; g_ls_list[k] = (uint32_t)id + 1; } else InterlockedIncrement(&g_ls_over);
     ReleaseSRWLockShared(&g_ls_lk);
 }
+#ifndef _WIN32
+#include <dlfcn.h>
+static uintptr_t g_ls_base_game, g_ls_base_exe;
+#endif
 static void ls_note_writer(EXCEPTION_POINTERS *e) {      /* who faulted: 0 game DLL, 1 a script module, 2 the exe, 3 other (system / driver / CRT) */
     HMODULE m = NULL; char mn[MAX_PATH] = "?"; uint64_t rip = e ? e->ContextRecord->Rip : 0;
+#ifdef _WIN32
     if (!rip || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)rip, &m)) { InterlockedIncrement64(&g_ls_fault_mod[4]); return; }
     int k = m == g_ls_mod_game ? 0 : m == g_ls_mod_exe ? 2 : 3;
     if (k == 3) { GetModuleFileNameA(m, mn, MAX_PATH); if (strstr(mn, "lua2cpp_")) k = 1; }
+#else       /* (one dladdr per first write, from the fault handler: no dlopen, no handle) */
+    Dl_info di;
+    if (!rip || !dladdr((void *)(uintptr_t)rip, &di) || !di.dli_fbase) { InterlockedIncrement64(&g_ls_fault_mod[4]); return; }
+    m = di.dli_fbase;
+    int k = (uintptr_t)m == g_ls_base_game ? 0 : (uintptr_t)m == g_ls_base_exe ? 2 : 3;
+    if (k == 3) { snprintf(mn, sizeof mn, "%s", di.dli_fname ? di.dli_fname : "?"); if (strstr(mn, "lua2cpp_")) k = 1; }
+#endif
     InterlockedIncrement64(&g_ls_fault_mod[k]);
     if (k < 2) return;
-    const char *b = strrchr(mn, '\\'); b = b ? b + 1 : mn; if (k == 2) b = "exe";
+    const char *b = strrchr(mn, '\\'); if (!b) b = strrchr(mn, '/'); b = b ? b + 1 : mn; if (k == 2) b = "exe";
     uint64_t off = rip - (uint64_t)(uintptr_t)m;
     AcquireSRWLockExclusive(&g_ls_wlock);
     int i; for (i = 0; i < g_ls_nw; i++) if (g_ls_w[i].off == off && !strcmp(g_ls_w[i].mod, b)) break;
@@ -99,10 +116,10 @@ static int ls_open(size_t id, EXCEPTION_POINTERS *e) {   /* the page writable fo
     for (;;) {
         uint8_t s = g_ls_st[id];
         if (s == 0) return 0;
-        if (s == 2) { DWORD old; InterlockedIncrement64(&g_ls_refault); return VirtualProtect(ls_addr(id), PG, PAGE_READWRITE, &old) ? 1 : 0; }
+        if (s == 2) { DWORD old; InterlockedIncrement64(&g_ls_refault); return LS_VP(ls_addr(id), PG, PAGE_READWRITE, &old) ? 1 : 0; }
         if (s == 3) { InterlockedIncrement64(&g_ls_spin); YieldProcessor(); continue; }
         if (__sync_bool_compare_and_swap(&g_ls_st[id], (uint8_t)1, (uint8_t)3)) {
-            DWORD old; int ok = VirtualProtect(ls_addr(id), PG, PAGE_READWRITE, &old) != 0;
+            DWORD old; int ok = LS_VP(ls_addr(id), PG, PAGE_READWRITE, &old) != 0;
             if (!ok) InterlockedIncrement64(&g_ls_protfail);
             ls_push(id); MemoryBarrier(); g_ls_st[id] = 2;
             if (e) { InterlockedIncrement64(&g_ls_faults); ls_note_writer(e); }
@@ -118,8 +135,8 @@ static LONG CALLBACK ls_veh(EXCEPTION_POINTERS *e) {
 static void ls_protect_run(size_t a, size_t b) {         /* ids [a, b): read-only (one call; per page if the run is not one region) */
     if (a >= b) return;
     DWORD old;
-    if (VirtualProtect(ls_addr(a), (b - a) * PG, PAGE_READONLY, &old)) { for (size_t i = a; i < b; i++) g_ls_st[i] = 1; g_ls_prot_pages += (long long)(b - a); return; }
-    for (size_t i = a; i < b; i++) { if (VirtualProtect(ls_addr(i), PG, PAGE_READONLY, &old)) { g_ls_st[i] = 1; g_ls_prot_pages++; } else g_ls_protfail++; }
+    if (LS_VP(ls_addr(a), (b - a) * PG, PAGE_READONLY, &old)) { for (size_t i = a; i < b; i++) g_ls_st[i] = 1; g_ls_prot_pages += (long long)(b - a); return; }
+    for (size_t i = a; i < b; i++) { if (LS_VP(ls_addr(i), PG, PAGE_READONLY, &old)) { g_ls_st[i] = 1; g_ls_prot_pages++; } else g_ls_protfail++; }
 }
 static void ls_protect_all(void) {                       /* threads held: every committed RW simulation page of the windows (g_r = r1's ranges) */
     double t0 = now_ms(); long long before = g_ls_prot_pages;
@@ -147,6 +164,9 @@ static void ls_after_setup(void) {                       /* mark_setup done, thr
         g_ls_mod_exe = GetModuleHandleA(NULL);
         {   const char *names[] = {getenv("SSBU_R1_GAMEDLL"), "ssbu_game.dll", "ssbu_game_p15n3.dll", "ssbu_game_eh_o1.dll", "ssbu_game_1305x.dll"};
             for (int i = 0; i < 5 && !g_ls_mod_game; i++) if (names[i] && names[i][0]) g_ls_mod_game = GetModuleHandleA(names[i]); }
+#ifndef _WIN32
+        g_ls_base_exe = plat_module_base(g_ls_mod_exe); g_ls_base_game = g_ls_mod_game ? plat_module_base(g_ls_mod_game) : 0;
+#endif
         AddVectoredExceptionHandler(1, ls_veh);
     }
     ls_protect_all();
@@ -174,7 +194,7 @@ static void ls_decay_run(void) {                         /* threads held, after 
         uint32_t v = g_ls_list[k]; if (!v) continue;
         size_t id = v - 1; int w = id >= g_ls_n1; size_t j = w ? id - g_ls_n1 : id; DWORD old;
         if ((uint32_t)g_ls_caps - g_ls_lc[k] >= (uint32_t)g_ls_decay && g_ls_st[id] == 2 && !ls_ns(id) && (w || !g_dc[j]) &&
-            VirtualProtect(ls_addr(id), PG, PAGE_READONLY, &old)) { g_ls_st[id] = 1; nd++; continue; }
+            LS_VP(ls_addr(id), PG, PAGE_READONLY, &old)) { g_ls_st[id] = 1; nd++; continue; }
         g_ls_list[m] = v; g_ls_lc[m] = g_ls_lc[k]; m++;
     }
     g_ls_n = m;
@@ -224,8 +244,8 @@ static void ls_fight_off(void) {                         /* the fight is over: e
         if (g_ls_st[a] != 1) { a++; continue; }
         size_t b = a; while (b < g_ls_np && g_ls_st[b] == 1 && (b == a || ls_addr(b) == ls_addr(b - 1) + PG)) b++;
         DWORD old;
-        if (VirtualProtect(ls_addr(a), (b - a) * PG, PAGE_READWRITE, &old)) n += (long long)(b - a);
-        else for (size_t i = a; i < b; i++) if (VirtualProtect(ls_addr(i), PG, PAGE_READWRITE, &old)) n++;
+        if (LS_VP(ls_addr(a), (b - a) * PG, PAGE_READWRITE, &old)) n += (long long)(b - a);
+        else for (size_t i = a; i < b; i++) if (LS_VP(ls_addr(i), PG, PAGE_READWRITE, &old)) n++;
         for (size_t i = a; i < b; i++) g_ls_st[i] = 0;
         a = b;
     }
@@ -241,7 +261,7 @@ static void ls_range(uint64_t a, uint64_t n, int what) { /* 0 r1_wrote: open; 1 
         if (ls_ns(id)) continue;
         if (what == 0) { if (g_ls_st[id] == 1 || g_ls_st[id] == 3) { ls_open(id, NULL); InterlockedIncrement64(&g_ls_wrote_open); } }
         else if (what == 1) { if (g_ls_st[id] == 1) ls_open(id, NULL); else if (g_ls_st[id] == 0) { g_ls_st[id] = 2; ls_push(id); } InterlockedIncrement64(&g_ls_dec_learn); }
-        else if (g_ls_st[id] <= 1) { DWORD old; if (VirtualProtect((void *)(uintptr_t)p, PG, PAGE_READONLY, &old)) { g_ls_st[id] = 1; InterlockedIncrement64(&g_ls_commit_prot); } }   /* (a commit over committed pages makes them read-write again) */
+        else if (g_ls_st[id] <= 1) { DWORD old; if (LS_VP((void *)(uintptr_t)p, PG, PAGE_READONLY, &old)) { g_ls_st[id] = 1; InterlockedIncrement64(&g_ls_commit_prot); } }   /* (a commit over committed pages makes them read-write again) */
         (void)run;
     }
 }

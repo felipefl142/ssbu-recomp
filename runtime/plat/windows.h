@@ -93,6 +93,7 @@ typedef UINT MMRESULT;
 #define ERROR_DIR_NOT_EMPTY 145
 #define ERROR_ALREADY_EXISTS 183
 #define ERROR_INVALID_ADDRESS 487
+#define ERROR_NOACCESS 998                 /* a read into memory that is not writable (EFAULT) */
 #define LOWORD(l) ((WORD)((DWORD_PTR)(l) & 0xffff))
 #define HIWORD(l) ((WORD)(((DWORD_PTR)(l) >> 16) & 0xffff))
 #define MAKEWORD(a, b) ((WORD)(((BYTE)(a)) | ((WORD)((BYTE)(b))) << 8))
@@ -112,7 +113,6 @@ typedef struct { ULONG_PTR Internal, InternalHigh; union { struct { DWORD Offset
 typedef struct { LONG left, top, right, bottom; } RECT;
 typedef struct { LONG x, y; } POINT;
 typedef struct { uint32_t Data1; uint16_t Data2, Data3; uint8_t Data4[8]; } GUID;
-typedef struct EXCEPTION_POINTERS EXCEPTION_POINTERS;        /* opaque: only passed along (hostrt.c diag_minidump, which is Windows-only) */
 typedef GUID IID, CLSID;
 #define IsEqualGUID(a, b) (memcmp((a), (b), sizeof(GUID)) == 0)
 
@@ -217,8 +217,11 @@ typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
 #define CREATE_SUSPENDED 0x4
 #define STACK_SIZE_PARAM_IS_A_RESERVATION 0x10000
 HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags, DWORD *tid);
+/* SuspendThread (Linux, x86-64): a signal to the thread, which waits in its handler until ResumeThread; counted as on
+ * Windows. A thread inside plat's memory bookkeeping (VirtualAlloc ...) stops when it leaves it. Fails ((DWORD)-1) for
+ * the calling thread, a thread not started or ended, and on macOS. */
 DWORD ResumeThread(HANDLE h);
-DWORD SuspendThread(HANDLE h);                           /* not possible here: (DWORD)-1 */
+DWORD SuspendThread(HANDLE h);
 HANDLE GetCurrentThread(void);
 HANDLE GetCurrentProcess(void);
 DWORD GetCurrentThreadId(void);
@@ -290,6 +293,43 @@ void SwitchToFiber(LPVOID fiber);
 void DeleteFiber(LPVOID fiber);
 LPVOID GetCurrentFiber(void);
 LPVOID GetFiberData(void);
+/* What Windows keeps in its fiber block and TEB, for the rollback's save of switched-away fibers (r1_state.c). A fiber
+ * block is PLAT_FIBER_BLOCK bytes (the registers saved at its last switch included); the functions also read a saved copy. */
+#define PLAT_FIBER_BLOCK 0x500
+int plat_fiber_stack(const void *fiber, uint64_t *lo, uint64_t *hi);   /* its whole host stack; 0 = none (a thread's own) */
+uint64_t plat_fiber_saved_sp(const void *fiber);         /* host stack pointer at its last switch away */
+void *plat_thread_fiber(HANDLE h);                       /* the fiber that thread runs now (Windows: TEB FiberData) */
+int plat_thread_stack(HANDLE h, uint64_t *lo, uint64_t *hi);           /* a thread's own stack (CreateThread threads) */
+
+/* ---- thread context and vectored exception handlers (x86-64 Linux; r1_state.c, rb_learned.c) ----
+ * CONTEXT: the integer registers only. GetThreadContext: from the suspended thread's signal frame (a running thread is
+ * suspended for the read). Vectored handlers run from plat's SIGSEGV / SIGBUS handler for a memory fault (code
+ * EXCEPTION_ACCESS_VIOLATION, ExceptionInformation[0] 1 = write, [1] = address); a change of ContextRecord is not applied.
+ * EXCEPTION_CONTINUE_SEARCH from all of them: the handler that was installed before (hostrt.c's crash report). */
+#define CONTEXT_AMD64 0x100000
+#define CONTEXT_CONTROL (CONTEXT_AMD64 | 0x1)
+#define CONTEXT_INTEGER (CONTEXT_AMD64 | 0x2)
+#define CONTEXT_FULL (CONTEXT_AMD64 | 0xb)
+typedef struct {
+    DWORD ContextFlags, EFlags;
+    DWORD64 Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15, Rip;
+} CONTEXT;
+BOOL GetThreadContext(HANDLE h, CONTEXT *c);
+#define EXCEPTION_ACCESS_VIOLATION 0xC0000005u
+#define EXCEPTION_CONTINUE_EXECUTION (-1)
+#define EXCEPTION_CONTINUE_SEARCH 0
+#define EXCEPTION_MAXIMUM_PARAMETERS 15
+typedef struct EXCEPTION_RECORD {
+    DWORD ExceptionCode, ExceptionFlags;
+    struct EXCEPTION_RECORD *ExceptionRecord;
+    PVOID ExceptionAddress;
+    DWORD NumberParameters;
+    ULONG_PTR ExceptionInformation[EXCEPTION_MAXIMUM_PARAMETERS];
+} EXCEPTION_RECORD;
+typedef struct EXCEPTION_POINTERS { EXCEPTION_RECORD *ExceptionRecord; CONTEXT *ContextRecord; } EXCEPTION_POINTERS;
+typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(EXCEPTION_POINTERS *e);
+PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER fn);
+int plat_protect_raw(void *p, size_t n, DWORD prot);    /* mprotect alone: VirtualQuery keeps the old protection (rb_learned.c) */
 
 /* ---- virtual memory (mmap, with a page-state map for VirtualQuery) ---- */
 #define MEM_COMMIT 0x1000

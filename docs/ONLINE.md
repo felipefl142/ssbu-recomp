@@ -22,7 +22,7 @@ Used from the next start.
 
 **Linux:** the same, with `./play.sh`; the file is `build-linux/config/graphics.ini` and the name defaults to your
 user name. The lobby needs nothing open. LAN and host modes need UDP 39500 (and 39501 for LAN) let in by the firewall,
-if one runs (`sudo firewall-cmd --add-port=39500-39501/udp`, `sudo ufw allow 39500:39501/udp`). Rollback is Windows only.
+if one runs (`sudo firewall-cmd --add-port=39500-39501/udp`, `sudo ufw allow 39500:39501/udp`). Rollback works on Windows and Linux (not macOS).
 
 ## The easy way: the F1 menu
 
@@ -142,7 +142,7 @@ sees rooms of its own build.
 Smooth fights at high ping: each game runs the match locally and only the players' inputs travel; a late input rolls the
 game back a few frames and replays them, instead of slowing both players down.
 
-1. **Switch it on:** in the game, **F1 -> Experimental -> Rollback netcode: ON**, then restart the game (Play SSBU.bat).
+1. **Switch it on:** in the game, **F1 -> Experimental -> Rollback netcode: ON**, then restart the game (Play SSBU.bat; on Linux `./play.sh`).
    Nothing extra to build: rollback runs on the normal game build (the game saves the fight by learning, at the start of
    each fight, which memory it writes). An older install's second copy for rollback (`ssbu_game_r1.dll`,
    `ssbu_native_rb.exe`, the folder `nro_bin_eh_o2r1`) is not used any more and can be deleted.
@@ -162,8 +162,8 @@ Input delay is chosen from the best measured round trip: 1 frame below about 117
 4 from about 184 ms (the rest of the trip is covered by rollback).
 
 Limits today: rollbacks of 3 or more frames take a little longer than one frame (a short hitch at very high ping);
-Windows only; tested between two games on one PC with simulated 150 ms ping and loss (0 desyncs), not yet much between
-real players over the internet. Please report how it feels.
+Windows and Linux (not macOS; a Windows game against a Linux one not tried); tested between two games on one PC with simulated 150 ms ping and loss (0 desyncs), not yet much between real
+players over the internet. Please report how it feels.
 
 
 ## Credit

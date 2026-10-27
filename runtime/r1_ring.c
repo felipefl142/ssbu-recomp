@@ -431,6 +431,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     double t1 = now_ms();
     hs_exclude_all();
     int nmod = 0;
+#ifdef _WIN32                                           /* (marked builds: Windows only) */
     {   HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
         MODULEENTRY32 me; me.dwSize = sizeof me;
         for (BOOL ok = sn != INVALID_HANDLE_VALUE && Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
@@ -440,6 +441,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             if (*a1 != *pm1) { *a1 = *pm1; *a2 = *pm2; *l1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *n2 = WN2; *n1 = g_wn1; nmod++; LOG("r1: RING rebase: mark maps set in %s (loaded after the first save)\n", me.szModule); }
         }
         if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
+#endif
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
     collect(c);
@@ -531,7 +533,7 @@ void nnunwind_catch_reinsert(uint64_t cfa, uint64_t jb); void nnunwind_catch_fre
 static uint64_t g_rgc_live[2048]; static int g_rgc_nlive; static long long g_rgc_dead;
 static void rgc_live_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
     (void)key; (void)c; (void)stack; (void)size;
-    if (fiber && g_rgc_nlive < 2048) g_rgc_live[g_rgc_nlive++] = *(uint64_t *)((uint8_t *)fiber + 0x20);
+    if (fiber && g_rgc_nlive < 2048) g_rgc_live[g_rgc_nlive++] = fib_lo(fiber);
 }
 static int rgc_dead(uint64_t jb) {                     /* jb on a host fiber stack that nothing uses now */
     size_t i; for (i = 0; i < g_nbf; i++) if (jb >= g_bf_lo[i] && jb < g_bf_hi[i]) break;
@@ -821,11 +823,17 @@ static DWORD WINAPI rgss_thread(void *p) {
         CONTEXT x; memset(&x, 0, sizeof x); x.ContextFlags = CONTEXT_FULL; nf = 0;
         if (GetThreadContext(g_rgss_main, &x)) {
             for (int d = 0; d < 64 && nf < 64; d++) {
+#ifdef _WIN32
                 DWORD64 base = 0; PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(x.Rip, &base, NULL);
+#else
+                void *f = NULL;                             /* (no unwinder here: the innermost frame only) */
+#endif
                 uint64_t g = guest_function_of(x.Rip);
                 if (g && (!nf || fr[nf - 1] != g)) fr[nf++] = g; else if (!g && d == 0) fr[nf++] = ((uint64_t)x.Rip >> 4 << 4) | (1ull << 63);      /* 1 = host code (imports, hooks); capture / load: the host address */
                 if (!f) break;
+#ifdef _WIN32
                 void *hd; DWORD64 est; RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, x.Rip, f, &x, &hd, &est, NULL);
+#endif
                 if (!x.Rip) break;
             }
         }
