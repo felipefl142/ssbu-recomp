@@ -12,10 +12,10 @@
  * Check: at the end of the re-run the pages the first pass changed are compared with their first-pass end state
  * (SSBU_R1 report "verify"), next to the fighters' hash (SSBU_FIGHT_HASH) that the comparison script reads.
  * Nothing here runs without SSBU_R1. No game content in this file. */
-#ifndef _WIN32
-/* Linux build: not available yet. The save / restore is built on Windows' vectored exception handlers (the write marks)
- * and on reading suspended threads' contexts; on Linux that would be signal handlers and ucontext. Off as when SSBU_R1 and
- * runahead are not set: every entry answers "off", so the callers take their normal paths. */
+#ifdef __APPLE__
+/* macOS build: not available yet. The save / restore needs SuspendThread, GetThreadContext and vectored exception handlers,
+ * which plat_posix.c has on Linux (signals, ucontext) but not on macOS. Off as when SSBU_R1 and runahead are not set: every
+ * entry answers "off", so the callers take their normal paths. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -27,7 +27,7 @@ int r1_on(void) {
     int gfx_runahead(void);
     if (!said && ((getenv("SSBU_R1") && getenv("SSBU_R1")[0] != '0') || (getenv("SSBU_RUNAHEAD") ? getenv("SSBU_RUNAHEAD")[0] != '0' : gfx_runahead()))) {
         said = 1;
-        printf("r1: state save / restore (SSBU_R1, run-ahead) is not available in the Linux build yet: off\n");
+        printf("r1: state save / restore (SSBU_R1, run-ahead) is not available in the macOS build yet: off\n");
     }
     return 0;
 }
@@ -48,6 +48,9 @@ void r1_nosim(uint64_t a, uint64_t n) { (void)a; (void)n; }
 void r1_read_retry_note(void) {}
 void r1_register_heap(void) { r1_on(); }
 #else
+#ifndef _WIN32
+#define _GNU_SOURCE                                     /* dl_iterate_phdr, dladdr (the fighter modules, rb_learned.c) */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,6 +167,7 @@ static void ex_cb(uint64_t key, int sig, int cnt, uint64_t len, uint64_t thread,
 static uint8_t *g_ar;
 static int cmp_rng(const void *x, const void *y) { const Rng *a = x, *b = y; return a->a < b->a ? -1 : a->a > b->a; }
 /* host DLLs that run fighter code (fighters_bin\*.dll, track S): their writable sections are simulation state too */
+#ifdef _WIN32
 #include <tlhelp32.h>
 static void add_fighter_dlls(void) {
     HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -185,6 +189,27 @@ static void add_fighter_dlls(void) {
     CloseHandle(sn);
     if (g_cycle == 0 && g_phase == 0) LOG("r1: fighter DLLs: %d, writable sections %.1f KB\n", nmod, bytes / 1024.0);
 }
+#else
+#include <link.h>
+static int g_fso_n; static size_t g_fso_bytes;
+static int fighter_so_cb(struct dl_phdr_info *in, size_t sz, void *u) {     /* the writable PT_LOAD segments (.data, .bss) of the fighters_bin modules */
+    (void)sz; (void)u;
+    if (!in->dlpi_name || !strstr(in->dlpi_name, "fighters_bin")) return 0;
+    for (int i = 0; i < in->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &in->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
+        uint64_t a = (in->dlpi_addr + ph->p_vaddr) & ~(uint64_t)(PG - 1), b = (in->dlpi_addr + ph->p_vaddr + ph->p_memsz + PG - 1) & ~(uint64_t)(PG - 1);
+        add_span((uint8_t *)(uintptr_t)a, (uint8_t *)(uintptr_t)b); g_fso_bytes += b - a;      /* (add_span keeps the read-write part: RELRO is read-only by then) */
+    }
+    g_fso_n++;
+    return 0;
+}
+static void add_fighter_dlls(void) {
+    g_fso_n = 0; g_fso_bytes = 0;
+    if (!getenv("SSBU_R1_NO_DLLS")) dl_iterate_phdr(fighter_so_cb, NULL);
+    if (g_cycle == 0 && g_phase == 0) LOG("r1: fighter modules: %d, writable segments %.1f KB\n", g_fso_n, g_fso_bytes / 1024.0);
+}
+#endif
 /* (R3 hs13, tw1j) the full save's copy of every range (r->s, ~1.9 GB in a match) is page memory of its own, not CRT heap: the
  * first save of the ring / run-ahead gives it back (decommits it) range by range while mark_setup moves it into the shadow,
  * so the peak commit is ~one copy of the game's memory instead of two (tw1j: a failed malloc there, not checked, crashed in
@@ -294,6 +319,15 @@ static long long g_th_audio_other;                   /* (R3 hs11) ring loads tha
 static Th g_th[256]; static int g_nth, g_th_mismatch, g_ninfo, g_park_ms = 500;
 static int g_th_running;                              /* (R3 pub1) ra_hold_restore: threads still RUNNING (not blocked at a wait) after the 500 ms */
 static int waiting_import(const char *s) { return s && (strstr(s, "Wait") || strstr(s, "wait") || strstr(s, "Sleep") || strstr(s, "Receive") || strstr(s, "Fiber") || strstr(s, "Timed")); }
+/* Linux: a stop is a signal the thread itself must run (plat_posix.c SuspendThread). A thread that runs guest code and is
+ * stopped, checked and let go again and again makes almost no progress between the stops (seen: the sound thread never got
+ * back to its wait within 500 ms, 14 loads refused in a 1,350-frame match). The loops below first look at the thread's
+ * import from here (no stop) and stop it only when it is in a waiting one, or when their time is up. */
+#ifdef _WIN32
+#define TH_NOT_YET(t, t0, lim) 0
+#else
+#define TH_NOT_YET(t, t0, lim) (!waiting_import((t)->c->in_import) && now_ms() - (t0) <= (lim))
+#endif
 /* restore_mode 0: hold every guest thread (except this one) once it is inside a waiting import, note where;
  * restore_mode 1: hold each once it waits at the SAME guest return address as at the save (500 ms at most) */
 static struct { HANDLE h; int timeouts; } g_tmo[256]; static int g_ntmo;
@@ -318,6 +352,7 @@ static void park(int restore_mode) {
         int *tm = tmo_of(t->h);
         if (tm && *tm >= 2) { if (restore_mode) t->same = 0; continue; }     /* never reaches a wait (nopus decode): not held */
         for (;;) {
+            if (TH_NOT_YET(t, t0, g_park_ms)) { SwitchToThread(); continue; }
             if (SuspendThread(t->h) == (DWORD)-1) break;
             const char *imp = t->c->in_import;
             int ok = waiting_import(imp) && (!restore_mode || (t->c->import_from == t->from && imp == t->imp));
@@ -359,7 +394,15 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
  * fiber) keeps its host state in two places that are not guest memory: the Windows fiber block (saved registers:
  * CONTEXT at +0x30, StackBase +0x10, StackLimit +0x18) and its host stack from the saved RSP to StackBase. Both are
  * copied with its guest context (Ctx); a restore puts all three back when the fiber is switched away then too. */
+#ifdef _WIN32
 #define FIB_BLOCK 0x500
+static uint64_t fib_lo(const void *b) { return *(const uint64_t *)((const uint8_t *)b + 0x20); }      /* DeallocationStack */
+static uint64_t fib_hi(const void *b) { return *(const uint64_t *)((const uint8_t *)b + 0x10); }      /* StackBase */
+#else                                                   /* plat_posix.c's fiber block (ucontext + its stack), also a saved copy */
+#define FIB_BLOCK PLAT_FIBER_BLOCK
+static uint64_t fib_lo(const void *b) { uint64_t lo = 0, hi = 0; plat_fiber_stack(b, &lo, &hi); return lo; }
+static uint64_t fib_hi(const void *b) { uint64_t lo = 0, hi = 0; plat_fiber_stack(b, &lo, &hi); return hi; }
+#endif
 typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[392]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; } Fib;
 static Fib g_fib[1024]; static int g_fib_running, g_nfib, g_fib_mode, g_fib_same, g_fib_diff, g_fib_new, g_fib_bad;
 void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);
@@ -408,8 +451,13 @@ static uint8_t *g_fpool; static size_t g_fpool_used, g_fpool_cap = 256u << 20;
 static size_t g_fib_bytes;
 static int fib_switched_away(Ctx *c) { return !c->in_import || strstr(c->in_import, "SwitchToFiber") != NULL; }
 static int fib_host(void *fiber, uint64_t *rsp, uint64_t *base) {
+#ifdef _WIN32
     uint8_t *f = fiber;
     uint64_t sb = *(uint64_t *)(f + 0x10), sl = *(uint64_t *)(f + 0x18), sp = *(uint64_t *)(f + 0x30 + 0x98);
+#else
+    uint64_t sl, sb, sp = plat_fiber_saved_sp(fiber);
+    if (!plat_fiber_stack(fiber, &sl, &sb)) return 0;
+#endif
     if (!(sl < sb && sp >= sl && sp < sb && sb - sp < (64u << 20))) return 0;
     *rsp = sp; *base = sb; return 1;
 }
@@ -419,7 +467,7 @@ static int fib_host(void *fiber, uint64_t *rsp, uint64_t *base) {
  * holds one of them is not copied back (counted, logged). SSBU_R1_LIVESTK=0: copied anyway (the old way, test). */
 static long long g_fib_live_skip, g_fib_live_seen; static int g_fib_live_on = -1;
 static uint64_t g_live_rsp[512], g_live_rip[512], g_live_fib[512]; static const char *g_live_nm[512]; static HANDLE g_live_h[512]; static int g_nlive;
-static uint8_t *live_teb_addr(HANDLE h);
+static uint64_t live_fiber_of(HANDLE h);
 int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h);
 static int g_live_cache = -1; static long long g_live_cached, g_live_asked;
 static void live_rsps(void) {
@@ -433,9 +481,10 @@ static void live_rsps(void) {
         int got = 0;
         if (g_live_cache) for (int j = 0; j < g_nth; j++) if (g_th[j].h == h) { if (g_th[j].held && g_th[j].cok) { x.Rsp = g_th[j].rsp; x.Rip = g_th[j].rip; got = 1; g_live_cached++; } break; }
         if (!got) { got = GetThreadContext(h, &x) != 0; g_live_asked++; }
-        if (got) { uint8_t *t = live_teb_addr(h); g_live_rsp[g_nlive] = x.Rsp; g_live_rip[g_nlive] = x.Rip; g_live_nm[g_nlive] = nm ? nm : "?"; g_live_h[g_nlive] = h; g_live_fib[g_nlive] = t ? *(volatile uint64_t *)(t + 0x20) : 0; g_nlive++; }
+        if (got) { g_live_rsp[g_nlive] = x.Rsp; g_live_rip[g_nlive] = x.Rip; g_live_nm[g_nlive] = nm ? nm : "?"; g_live_h[g_nlive] = h; g_live_fib[g_nlive] = live_fiber_of(h); g_nlive++; }
     }
 }
+#ifdef _WIN32
 static void live_teb(HANDLE h, uint64_t *fd, uint64_t *sb, uint64_t *sl) {     /* (diagnosis) that thread's TEB: FiberData, StackBase, StackLimit */
     *fd = *sb = *sl = 0;
     typedef LONG (WINAPI *QitFn)(HANDLE, int, void *, ULONG, ULONG *);
@@ -455,13 +504,22 @@ static uint8_t *live_teb_addr(HANDLE h) {               /* a thread's TEB (cache
     if (g_nteb < 512) { g_teb_cache[g_nteb].h = h; g_teb_cache[g_nteb].teb = tb.teb; g_nteb++; }
     return tb.teb;
 }
+static uint64_t live_fiber_of(HANDLE h) { uint8_t *t = live_teb_addr(h); return t ? *(volatile uint64_t *)(t + 0x20) : 0; }     /* TEB FiberData */
+#else                                                   /* plat_posix.c keeps the running fiber and the stack of each thread */
+static void live_teb(HANDLE h, uint64_t *fd, uint64_t *sb, uint64_t *sl) {
+    *fd = *sb = *sl = 0;
+    *fd = (uint64_t)(uintptr_t)plat_thread_fiber(h ? h : GetCurrentThread());
+    if (h) plat_thread_stack(h, sl, sb);
+}
+static uint64_t live_fiber_of(HANDLE h) { return (uint64_t)(uintptr_t)plat_thread_fiber(h); }
+#endif
 static int live_running(void *fiber) {                 /* the host fiber is the current fiber of a thread (its TEB says so) */
     for (int i = 0; i < g_nlive; i++) if (g_live_fib[i] && g_live_fib[i] == (uint64_t)(uintptr_t)fiber) return i + 1;
     return 0;
 }
 static long long g_fib_teb_running;                     /* fibers taken as running at a capture because a thread's TEB names them (run tid said not) */
 static int live_on_stack(const uint8_t *blk) {          /* a fiber block (saved copy): +0x20 DeallocationStack, +0x10 StackBase */
-    uint64_t lo = *(const uint64_t *)(blk + 0x20), hi = *(const uint64_t *)(blk + 0x10);
+    uint64_t lo = fib_lo(blk), hi = fib_hi(blk);
     for (int i = 0; i < g_nlive; i++) if (g_live_rsp[i] >= lo && g_live_rsp[i] < hi) return i + 1;
     return 0;
 }
@@ -519,15 +577,15 @@ static void fibers_restore_all(void) {
             if (g_fib_live_seen <= 20) {
                 uint64_t fd, sb, sl; live_teb(g_live_h[live - 1], &fd, &sb, &sl);
                 LOG("r1:   fiber %llx: its host stack %p [%llx..%llx] is IN USE now by %s (rsp %llx rip %llx; its TEB: fiber %llx stack %llx..%llx); saved rsp %llx + %zu, host fiber now %p, run tid now %lu: %s\n",
-                    (unsigned long long)f->key, f->fiber, (unsigned long long)*(uint64_t *)(f->blk + 0x20), (unsigned long long)*(uint64_t *)(f->blk + 0x10), g_live_nm[live - 1],
+                    (unsigned long long)f->key, f->fiber, (unsigned long long)fib_lo(f->blk), (unsigned long long)fib_hi(f->blk), g_live_nm[live - 1],
                     (unsigned long long)g_live_rsp[live - 1], (unsigned long long)g_live_rip[live - 1], (unsigned long long)fd, (unsigned long long)sl, (unsigned long long)sb,
                     (unsigned long long)f->rsp, f->n, cf, j < g_ncur ? (unsigned long)g_cur[j].tid : 0ul, g_fib_live_on ? "not copied back" : "copied back anyway (SSBU_R1_LIVESTK=0)");
             }
-            if (g_fib_live_on) { g_fib_live_skip++; g_fib_diff++; R1_CTR("restore: fiber stack in use, not copied back (key, lo)", f->key, *(uint64_t *)(f->blk + 0x20)); continue; }
+            if (g_fib_live_on) { g_fib_live_skip++; g_fib_diff++; R1_CTR("restore: fiber stack in use, not copied back (key, lo)", f->key, fib_lo(f->blk)); continue; }
         }
         if (f->susp && !running_now) {                        /* whole host + guest state back */
-            if (g_nrest < 1024) { g_rest_lo[g_nrest] = *(uint64_t *)(f->blk + 0x20); g_rest_hi[g_nrest] = *(uint64_t *)(f->blk + 0x10); g_nrest++; }
-            R1_CTR("restore: fiber stack copied back (key, lo)", f->key, *(uint64_t *)(f->blk + 0x20));
+            if (g_nrest < 1024) { g_rest_lo[g_nrest] = fib_lo(f->blk); g_rest_hi[g_nrest] = fib_hi(f->blk); g_nrest++; }
+            R1_CTR("restore: fiber stack copied back (key, lo)", f->key, fib_lo(f->blk));
             memcpy((void *)(uintptr_t)f->rsp, f->stk, f->n);
             memcpy(f->fiber, f->blk, FIB_BLOCK);
             if (f->fls) memcpy(f->fls, f->flsb, sizeof f->flsb);
@@ -977,7 +1035,7 @@ static void hs_exclude(uint64_t lo, uint64_t hi, const char *what) {
  * fiber uses any more after a ring load is dead (r1_ring.c rgc_after drops it instead of keeping it for ever) */
 static uint64_t *g_bf_lo, *g_bf_hi; static size_t g_nbf, g_cbf; static SRWLOCK g_bf_lock = SRWLOCK_INIT;
 static void bf_add(void *fiber) {
-    uint64_t lo = *(uint64_t *)((uint8_t *)fiber + 0x20), hi = *(uint64_t *)((uint8_t *)fiber + 0x10);
+    uint64_t lo = fib_lo(fiber), hi = fib_hi(fiber);
     if (!(lo < hi)) return;
     AcquireSRWLockExclusive(&g_bf_lock);
     size_t i; for (i = 0; i < g_nbf; i++) if (g_bf_lo[i] == lo) { g_bf_hi[i] = hi; break; }
@@ -991,16 +1049,19 @@ static void bf_add(void *fiber) {
 static void hs_fiber_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
     (void)key; (void)c; (void)stack; (void)size;
     if (fiber) bf_add(fiber);
-    if (fiber) hs_exclude(*(uint64_t *)((uint8_t *)fiber + 0x20), *(uint64_t *)((uint8_t *)fiber + 0x10), "fiber stack");
+    if (fiber) hs_exclude(fib_lo(fiber), fib_hi(fiber), "fiber stack");
 }
 extern void (*g_r1_fiber_born)(void *fiber);           /* os_threads.c: a host fiber made later (fib_init, a fresh one at a restore) */
 static void hs_fiber_born(void *fiber) { if (fiber) { long long b = g_hs_pages; hs_fiber_cb(0, NULL, 0, 0, fiber); if (g_hs_pages != b) g_hs_fibers_later++; } }
 static uint64_t g_hs_note[16][2]; static int g_hs_nnote;     /* host stacks this exe makes itself (not threads, not guest fibers): noted, left out at the setup */
 static void r1_host_stack_note(uint64_t lo, uint64_t hi) { if (g_hs_nnote < 16) { g_hs_note[g_hs_nnote][0] = lo; g_hs_note[g_hs_nnote][1] = hi; g_hs_nnote++; } if (g_ns2 && (g_hs_on < 0 || g_hs_on)) hs_exclude(lo, hi, "host stack (noted)"); }
+#ifdef _WIN32
 typedef struct { LONG st; void *teb; void *pid, *tid; ULONG_PTR mask; LONG pri, bpri; } HsTbi;
+#endif
 static void hs_exclude_all(void) {
     if (g_hs_on < 0) { const char *e = getenv("SSBU_R1_HOST_STACKS"); g_hs_on = !(e && e[0] == '0'); }
     if (!g_hs_on) return;
+#ifdef _WIN32
     typedef LONG (WINAPI *QitFn)(HANDLE, int, void *, ULONG, ULONG *);
     QitFn qit = (QitFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
     HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -1017,6 +1078,16 @@ static void hs_exclude_all(void) {
         CloseHandle(h);
     }
     if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn);
+#else
+    /* the guest threads' own stacks (plat_posix.c notes them) and this thread's; the other host threads' stacks are made by
+     * pthreads at the top of the address space, far from the windows */
+    int nth = 0;
+    {   Ctx *tc; const char *tn; HANDLE th; uint64_t lo, hi;
+        for (int i = 0; guest_thread_info(i, &tc, &tn, &th); i++)
+            if (th && plat_thread_stack(th, &lo, &hi)) { char nm[64]; snprintf(nm, sizeof nm, "thread %s stack", tn ? tn : "?"); hs_exclude(lo, hi, nm); nth++; }
+        uintptr_t l2, h2; if (plat_current_stack(&l2, &h2)) { hs_exclude(l2, h2, "this thread's stack"); nth++; }
+    }
+#endif
     os_r1_fibers(hs_fiber_cb);
     for (int i = 0; i < g_hs_nnote; i++) hs_exclude(g_hs_note[i][0], g_hs_note[i][1], "host stack (noted)");
     g_r1_fiber_born = hs_fiber_born;
@@ -1099,6 +1170,7 @@ static int mark_setup(void) {
     if (!m1 || !m2) { if (m1) VirtualFree(m1, 0, MEM_RELEASE); if (m2) VirtualFree(m2, 0, MEM_RELEASE); LOG("r1: MARK setup: allocation of the mark maps FAILED: marks OFF\n"); mark_undo(); return 0; }
     *pm1 = m1; *pm2 = m2; *plo1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *pn2 = WN2; *pn1 = g_wn1;
     r1_m1 = m1; r1_m2 = m2; r1_lo1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); r1_n2 = WN2; r1_n1 = g_wn1;
+#ifdef _WIN32                                           /* (Linux has no marked builds: the learned set uses the exe's maps alone) */
     {   int nmod = 0; char names[1500]; int o = 0;
         HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
         MODULEENTRY32 me; me.dwSize = sizeof me;
@@ -1113,6 +1185,7 @@ static int mark_setup(void) {
         names[o] = 0;
         LOG("r1: MARK maps set in the exe and %d modules:%s\n", nmod, names);
     }
+#endif
     blk1_init();
     for (int i = 0; i < g_nx; i++) if (g_x[i].n >= 65536) LOG("r1:   extra %s + %.0f KB\n", where(g_x[i].a), g_x[i].n / 1024.0);
     LOG("r1: MARK on: window 1 = region at %p, %.1f GB (map %.1f MB), window 2 = %llx + %.0f GB (map %.1f MB); shadow filled with %.1f MB; extras %d ranges %.1f MB copied whole each time\n",
@@ -1370,7 +1443,7 @@ static void veh_fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void
 static uint64_t g_veh_rsp; static int g_veh_hits;
 static void veh_fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fiber) {
     if (!fiber) return;
-    uint64_t sb = *(uint64_t *)((uint8_t *)fiber + 0x10), da = *(uint64_t *)((uint8_t *)fiber + 0x20);
+    uint64_t sb = fib_hi(fiber), da = fib_lo(fiber);
     if (g_veh_rsp >= da && g_veh_rsp < sb) {
         int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == key) break;
         LOG("r1: CRASH on the host stack of fiber %llx (guest stack %llx..%llx, ctx %p fn %llx sp %llx tid-now %lu; at the last save: %s)\n", (unsigned long long)key,
@@ -1468,7 +1541,11 @@ static int th_blocked(HANDLE h) {
         if (!VirtualQuery(r - 2, &m, sizeof m) || m.State != MEM_COMMIT || !(m.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE | PAGE_EXECUTE_READWRITE))) return 0;
         if (!(m.Protect & PAGE_EXECUTE_READWRITE)) { int k = nc < 8 ? nc++ : (int)(a >> 12) & 7; lo[k] = (uintptr_t)m.BaseAddress; hi[k] = lo[k] + m.RegionSize; }
     }
+#ifdef _WIN32
     return r[-2] == 0x0f && r[-1] == 0x05;
+#else       /* (Linux: the stop is a signal; a call it interrupts is restarted (SA_RESTART), the RIP then set back onto the `syscall`) */
+    return (r[-2] == 0x0f && r[-1] == 0x05) || (r[0] == 0x0f && r[1] == 0x05);
+#endif
 }
 static int ra_audio(const char *n) { return strstr(n, "nus3::audio") || strstr(n, "sindou") || strstr(n, "AudioDevice"); }
 static int ra_free(const char *n) { return strstr(n, "nopus") != NULL; }      /* never in a waiting import; its pages (decoder state, output) are not simulation */
@@ -1512,6 +1589,7 @@ static int ra_hold_save(void) {
         }
         int spins = 0;
         for (;;) {
+            if (TH_NOT_YET(t, t0, g_ra_park_ms)) { spins++; SwitchToThread(); continue; }
             if (SuspendThread(t->h) == (DWORD)-1) break;
             if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; break; }
             ResumeThread(t->h); spins++;
@@ -1542,6 +1620,7 @@ static void ra_hold_restore(void) {
         if (!t->parked) continue;
         double t0 = now_ms();
         for (;;) {
+            if (TH_NOT_YET(t, t0, 500)) { SwitchToThread(); continue; }
             if (SuspendThread(t->h) == (DWORD)-1) break;
             if (t->c->import_from == t->from && t->c->in_import == t->imp && th_blocked(t->h)) { t->held = 1; t->same = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; break; }
             /* (R3 hs11) the sound thread sindou::update alternates SleepThread / WaitEvent; at a ring load it sometimes waits for an

@@ -123,6 +123,7 @@ static DWORD err_from_errno(int e) {
     case ENOTEMPTY: return ERROR_DIR_NOT_EMPTY;
     case ENOSPC: return ERROR_DISK_FULL;
     case EINVAL: return ERROR_INVALID_PARAMETER;
+    case EFAULT: return ERROR_NOACCESS;
     default: return 0x1F;    /* ERROR_GEN_FAILURE */
     }
 }
@@ -264,6 +265,10 @@ typedef struct PlatObj {
     /* threads */
     pthread_t th; pid_t tid; DWORD exit_code; int started;
     LPTHREAD_START_ROUTINE fn; LPVOID arg;
+    void **fiber_slot;               /* the thread's running fiber (its t_fiber), for plat_thread_fiber */
+    uintptr_t stk_lo, stk_hi;        /* its own stack */
+    volatile uint32_t sus_req, sus_ack, sus_res;    /* SuspendThread: stops asked / acknowledged by the thread, resumes */
+    DWORD sus_count; void *sus_uc;   /* (g_sus_lock) suspend count; the stopped thread's signal context */
     /* files, finds, mappings */
     int fd;
     DIR *dir; char dir_path[MAX_PATH]; char pattern[MAX_PATH];
@@ -302,9 +307,25 @@ static int is_obj(HANDLE h) { return h && h != INVALID_HANDLE_VALUE && h != PSEU
 
 /* threads */
 static __thread PlatObj *t_self;
+/* A thread is never stopped by SuspendThread while it holds g_vm_lock (the rollback's caller asks VirtualQuery while
+ * threads are stopped): the stop waits until it lets the lock go (sus_handler, sus_deferred). */
+static __thread int t_nosus, t_sus_pending;
+static void sus_deferred(void);
+static void **this_fiber_slot(void);
+static void thread_note(PlatObj *o) {                  /* the calling thread's fiber slot and stack bounds into its object */
+    o->fiber_slot = this_fiber_slot();
+#ifndef __APPLE__
+    pthread_attr_t a; void *base; size_t sz;
+    if (!pthread_getattr_np(pthread_self(), &a)) {
+        if (!pthread_attr_getstack(&a, &base, &sz)) { o->stk_lo = (uintptr_t)base; o->stk_hi = (uintptr_t)base + sz; }
+        pthread_attr_destroy(&a);
+    }
+#endif
+}
 static void *thread_tramp(void *p) {
     PlatObj *o = p;
     t_self = o;
+    thread_note(o);
     o->tid = os_tid();
     pthread_mutex_lock(&o->m);
     while (!o->started) pthread_cond_wait(&o->cv, &o->m);     /* CREATE_SUSPENDED: held until ResumeThread */
@@ -331,17 +352,114 @@ HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTIN
     if (tid) { while (!__atomic_load_n(&o->tid, __ATOMIC_ACQUIRE)) sched_yield(); *tid = (DWORD)o->tid; }
     return o;
 }
+/* SuspendThread / ResumeThread of a running thread (Linux, x86-64; the rollback's save holds the guest threads at their
+ * waits, r1_state.c). The stop is a signal (SIGRTMIN + 6): the thread's handler acknowledges it and waits until the
+ * count drops back to 0; its signal context is what GetThreadContext reads. A thread blocked in a system call sits in
+ * the handler with its RIP at (restarted) or just after (interrupted) the `syscall` instruction; the call is restarted
+ * or returns EINTR (the runtime's waits take that as a spurious wake-up). A thread that holds g_vm_lock stops when it lets
+ * it go. macOS: (DWORD)-1, which every caller handles. */
+#if defined(__linux__) && defined(__x86_64__)
+static int g_sus_sig;
+static pthread_mutex_t g_sus_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_sus_once = PTHREAD_ONCE_INIT;
+static void sus_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    PlatObj *o = t_self;
+    if (!o) return;
+    if (t_nosus) { t_sus_pending = 1; return; }        /* inside g_vm_lock: stopped at vm_unlock */
+    int e = errno;
+    uint32_t want = __atomic_load_n(&o->sus_req, __ATOMIC_ACQUIRE), r0 = __atomic_load_n(&o->sus_res, __ATOMIC_ACQUIRE);
+    o->sus_uc = uc;
+    __atomic_store_n(&o->sus_ack, want, __ATOMIC_RELEASE);
+    futex(&o->sus_ack, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
+    while (__atomic_load_n(&o->sus_res, __ATOMIC_ACQUIRE) == r0) futex(&o->sus_res, FUTEX_WAIT_PRIVATE, r0, NULL);
+    errno = e;
+}
+static void sus_deferred(void) { t_sus_pending = 0; syscall(SYS_tgkill, getpid(), os_tid(), g_sus_sig); }
+static void sus_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    g_sus_sig = SIGRTMIN + 6;
+    sa.sa_sigaction = sus_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(g_sus_sig, &sa, NULL);
+}
+static PlatObj *sus_target(HANDLE h) {                 /* a started, running thread other than this one */
+    if (!is_obj(h)) return NULL;
+    PlatObj *o = h;
+    if (o->kind != PO_THREAD || !o->started || __atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE) || !o->tid || o->tid == os_tid()) return NULL;
+    return o;
+}
+DWORD SuspendThread(HANDLE h) {
+    PlatObj *o = sus_target(h);
+    if (!o) return (DWORD)-1;
+    pthread_once(&g_sus_once, sus_install);
+    pthread_mutex_lock(&g_sus_lock);
+    DWORD prev = o->sus_count;
+    if (!prev) {
+        uint32_t req = __atomic_add_fetch(&o->sus_req, 1, __ATOMIC_SEQ_CST);
+        if (syscall(SYS_tgkill, getpid(), o->tid, g_sus_sig)) { pthread_mutex_unlock(&g_sus_lock); return (DWORD)-1; }
+        for (;;) {
+            uint32_t a = __atomic_load_n(&o->sus_ack, __ATOMIC_ACQUIRE);
+            if (a == req) break;
+            if (__atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE)) { pthread_mutex_unlock(&g_sus_lock); return (DWORD)-1; }   /* it ended meanwhile */
+            struct timespec ts = {0, 1000000};
+            futex(&o->sus_ack, FUTEX_WAIT_PRIVATE, a, &ts);
+        }
+    }
+    o->sus_count = prev + 1;
+    pthread_mutex_unlock(&g_sus_lock);
+    return prev;
+}
+static DWORD sus_resume(PlatObj *o) {
+    pthread_mutex_lock(&g_sus_lock);
+    DWORD prev = o->sus_count;
+    if (prev && !--o->sus_count) {
+        o->sus_uc = NULL;
+        __atomic_add_fetch(&o->sus_res, 1, __ATOMIC_SEQ_CST);
+        futex(&o->sus_res, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
+    }
+    pthread_mutex_unlock(&g_sus_lock);
+    return prev;
+}
+BOOL GetThreadContext(HANDLE h, CONTEXT *c) {
+    PlatObj *o = sus_target(h);
+    if (!o || SuspendThread(h) == (DWORD)-1) return FALSE;       /* held already: the count goes up and back down */
+    const greg_t *g = ((ucontext_t *)o->sus_uc)->uc_mcontext.gregs;
+    c->Rax = g[REG_RAX]; c->Rcx = g[REG_RCX]; c->Rdx = g[REG_RDX]; c->Rbx = g[REG_RBX]; c->Rsp = g[REG_RSP]; c->Rbp = g[REG_RBP];
+    c->Rsi = g[REG_RSI]; c->Rdi = g[REG_RDI]; c->R8 = g[REG_R8]; c->R9 = g[REG_R9]; c->R10 = g[REG_R10]; c->R11 = g[REG_R11];
+    c->R12 = g[REG_R12]; c->R13 = g[REG_R13]; c->R14 = g[REG_R14]; c->R15 = g[REG_R15]; c->Rip = g[REG_RIP]; c->EFlags = (DWORD)g[REG_EFL];
+    sus_resume(o);
+    return TRUE;
+}
+#else
+static void sus_deferred(void) { t_sus_pending = 0; }
+static DWORD sus_resume(PlatObj *o) { (void)o; return 0; }
+DWORD SuspendThread(HANDLE h) { (void)h; return (DWORD)-1; }
+BOOL GetThreadContext(HANDLE h, CONTEXT *c) { (void)h; (void)c; return FALSE; }
+#endif
 DWORD ResumeThread(HANDLE h) {
     if (!is_obj(h)) return (DWORD)-1;
     PlatObj *o = h;
+    if (o->kind == PO_THREAD && __atomic_load_n(&o->started, __ATOMIC_ACQUIRE)) return sus_resume(o);
     pthread_mutex_lock(&o->m);
     DWORD was = o->started ? 0 : 1;
-    o->started = 1;
+    __atomic_store_n(&o->started, 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&o->cv);
     pthread_mutex_unlock(&o->m);
     return was;
 }
-DWORD SuspendThread(HANDLE h) { (void)h; return (DWORD)-1; }      /* pthreads cannot stop another thread: failure, which every caller (diagnostics) handles */
+void *plat_thread_fiber(HANDLE h) {
+    if (h == PSEUDO_THREAD) return *this_fiber_slot();
+    if (!is_obj(h) || ((PlatObj *)h)->kind != PO_THREAD || !((PlatObj *)h)->fiber_slot) return NULL;
+    return __atomic_load_n(((PlatObj *)h)->fiber_slot, __ATOMIC_RELAXED);
+}
+int plat_thread_stack(HANDLE h, uint64_t *lo, uint64_t *hi) {
+    if (!is_obj(h) || ((PlatObj *)h)->kind != PO_THREAD || !((PlatObj *)h)->stk_hi) return 0;
+    *lo = ((PlatObj *)h)->stk_lo; *hi = ((PlatObj *)h)->stk_hi;
+    return 1;
+}
 HANDLE GetCurrentThread(void) { return PSEUDO_THREAD; }
 HANDLE GetCurrentProcess(void) { return PSEUDO_PROCESS; }
 DWORD GetCurrentThreadId(void) { static __thread DWORD id; if (!id) id = (DWORD)os_tid(); return id; }
@@ -390,6 +508,7 @@ BOOL DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, HANDLE *dst, DWORD access
         if (o) { __atomic_add_fetch(&o->refs, 1, __ATOMIC_ACQ_REL); *dst = o; return TRUE; }
         o = obj_new(PO_THREAD);
         o->th = pthread_self(); o->tid = os_tid(); o->started = 1; o->exit_code = STILL_ACTIVE;
+        thread_note(o);
         o->refs = 2; t_self = o;                   /* the thread's own reference is never dropped: it was not made by CreateThread */
         *dst = o;
         return TRUE;
@@ -506,6 +625,10 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
 }
 DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     /* rare (diagnostic threads): polls every millisecond; with `all` the objects are taken one after another, not at once as on Windows */
+    if (all && ms == INFINITE) {                   /* (the rollback's copy threads, r1_state.c cp_run, every frame: no 1 ms poll) */
+        for (DWORD i = 0; i < n; i++) if (WaitForSingleObject(hs[i], INFINITE) != WAIT_OBJECT_0) return WAIT_FAILED;
+        return WAIT_OBJECT_0;
+    }
     int64_t end = ms == INFINITE ? INT64_MAX : mono_ns() + (int64_t)ms * 1000000LL;
     for (;;) {
         if (all) {
@@ -568,10 +691,26 @@ typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *sta
 #else
 typedef struct { ucontext_t uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; } Fiber;
 #endif
+_Static_assert(sizeof(Fiber) <= PLAT_FIBER_BLOCK, "a fiber block is PLAT_FIBER_BLOCK bytes (r1_state.c copies that much)");
 static __thread Fiber *t_fiber;
+static void **this_fiber_slot(void) { return (void **)&t_fiber; }
+int plat_fiber_stack(const void *fiber, uint64_t *lo, uint64_t *hi) {
+    const Fiber *f = fiber;
+    if (!f || f->is_thread || !f->stack) return 0;
+    *lo = (uintptr_t)f->stack; *hi = (uintptr_t)f->stack + f->stack_size;
+    return 1;
+}
+uint64_t plat_fiber_saved_sp(const void *fiber) {
+    const Fiber *f = fiber;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return f->uc.r[12];
+#else
+    return (uint64_t)f->uc.uc_mcontext.gregs[REG_RSP];
+#endif
+}
 LPVOID ConvertThreadToFiber(LPVOID param) {
     if (t_fiber) return t_fiber;
-    Fiber *f = calloc(1, sizeof *f);
+    Fiber *f = calloc(1, PLAT_FIBER_BLOCK);
     f->param = param; f->is_thread = 1;
     t_fiber = f;
     return f;
@@ -580,7 +719,7 @@ BOOL ConvertFiberToThread(void) { if (t_fiber && t_fiber->is_thread) free(t_fibe
 static void fiber_entry(void) { Fiber *f = t_fiber; f->fn(f->param); fprintf(stderr, "plat: a fiber returned\n"); ExitProcess(3); }
 LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_ROUTINE fn, LPVOID param) {
     (void)commit; (void)flags;
-    Fiber *f = calloc(1, sizeof *f);
+    Fiber *f = calloc(1, PLAT_FIBER_BLOCK);
     f->fn = fn; f->param = param;
     f->stack_size = reserve ? reserve : (SIZE_T)1 << 20;
     f->stack = mmap(NULL, f->stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
@@ -653,6 +792,8 @@ typedef struct { uintptr_t lo, hi, alloc_base; DWORD state, prot, alloc_prot; } 
 static Seg *g_seg;
 static int g_nseg, g_capseg;
 static pthread_mutex_t g_vm_lock = PTHREAD_MUTEX_INITIALIZER;
+static void vm_lock(void) { t_nosus++; pthread_mutex_lock(&g_vm_lock); }
+static void vm_unlock(void) { pthread_mutex_unlock(&g_vm_lock); if (!--t_nosus && t_sus_pending) sus_deferred(); }
 #define PAGE 4096u
 static int prot_posix(DWORD p) {
     switch (p & 0xff) {
@@ -750,10 +891,10 @@ static int ww_find(uintptr_t a) { for (int i = 0; i < g_nww; i++) if (a >= g_ww[
 static void ww_drop(uintptr_t lo) { int i = ww_find(lo); if (i >= 0) g_ww[i] = g_ww[--g_nww]; }      /* munmap unregisters by itself */
 UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR *count, ULONG *gran) {
     uintptr_t lo = (uintptr_t)base & ~(uintptr_t)(PAGE - 1), hi = ((uintptr_t)base + size + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = ww_find(lo);
     int ok = i >= 0 && hi <= g_ww[i].hi;
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     if (!ok || !size) { t_lasterr = ERROR_INVALID_PARAMETER; return 1; }
     struct page_region v[256];
     ULONG_PTR max = *count, got = 0;
@@ -777,9 +918,9 @@ UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR
 }
 UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
     uintptr_t lo = (uintptr_t)base & ~(uintptr_t)(PAGE - 1), hi = ((uintptr_t)base + size + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = ww_find(lo);
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     if (i < 0) return 1;
     ww_protect(lo, hi - lo);
     return 0;
@@ -897,25 +1038,25 @@ static void ww_protect(uintptr_t lo, size_t n) {          /* decommitted pieces:
 }
 UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR *count, ULONG *gran) {
     uintptr_t lo = (uintptr_t)base & ~(uintptr_t)(PAGE - 1), hi = ((uintptr_t)base + size + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = ww_find(lo);
-    if (i < 0 || hi > g_ww[i].hi || !size) { pthread_mutex_unlock(&g_vm_lock); t_lasterr = ERROR_INVALID_PARAMETER; return 1; }
+    if (i < 0 || hi > g_ww[i].hi || !size) { vm_unlock(); t_lasterr = ERROR_INVALID_PARAMETER; return 1; }
     ULONG_PTR max = *count, got = 0;
     uintptr_t H = g_hpage, p = lo;
     for (; p < hi && got < max; p += PAGE)
         if (__atomic_load_n(&g_ww[i].dirty[(p - g_ww[i].lo) / H], __ATOMIC_ACQUIRE) & (1u << ((p & (H - 1)) / PAGE))) addrs[got++] = (PVOID)p;
     if (flags & WRITE_WATCH_FLAG_RESET) ww_reset(i, lo, p, 1);           /* the pieces looked at */
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     if (gran) *gran = PAGE;
     *count = got;
     return 0;
 }
 UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
     uintptr_t lo = (uintptr_t)base & ~(uintptr_t)(PAGE - 1), hi = ((uintptr_t)base + size + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = ww_find(lo);
     if (i >= 0) ww_reset(i, lo, hi < g_ww[i].hi ? hi : g_ww[i].hi, 1);
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     return i < 0;
 }
 #endif
@@ -924,7 +1065,7 @@ UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (!size) { t_lasterr = ERROR_INVALID_PARAMETER; return NULL; }
     uintptr_t a = (uintptr_t)addr;
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     if (type & MEM_RESERVE || !addr) {
         uintptr_t lo = a & ~(uintptr_t)0xffff;          /* reservations start on 64 KB, as on Windows */
         size_t n = (size + (a - lo) + PAGE - 1) & ~(size_t)(PAGE - 1);
@@ -951,7 +1092,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         }
         if (p == MAP_FAILED || (addr && (uintptr_t)p != lo)) {
             if (p != MAP_FAILED) munmap(p, nm);
-            pthread_mutex_unlock(&g_vm_lock);
+            vm_unlock();
             t_lasterr = ERROR_INVALID_ADDRESS;
             return NULL;
         }
@@ -959,30 +1100,30 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         seg_set(lo, lo + n, lo, commit ? MEM_COMMIT : MEM_RESERVE, commit ? prot : 0, prot);
         if (type & MEM_WRITE_WATCH) ww_add(lo, n);
         if (commit) vm_sync(lo, lo + n);
-        pthread_mutex_unlock(&g_vm_lock);
+        vm_unlock();
         return addr ? (void *)a : p;
     }
     /* commit inside a reservation */
     uintptr_t lo = a & ~(uintptr_t)(PAGE - 1), hi = (a + size + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
     int i = seg_find(lo);
-    if (i >= g_nseg || g_seg[i].lo > lo) { pthread_mutex_unlock(&g_vm_lock); t_lasterr = ERROR_INVALID_ADDRESS; return NULL; }
+    if (i >= g_nseg || g_seg[i].lo > lo) { vm_unlock(); t_lasterr = ERROR_INVALID_ADDRESS; return NULL; }
     uintptr_t base = g_seg[i].alloc_base; DWORD aprot = g_seg[i].alloc_prot;
     for (uintptr_t p = lo; p < hi;) {                  /* the whole range must be reserved */
         int k = seg_find(p);
-        if (k >= g_nseg || g_seg[k].lo > p) { pthread_mutex_unlock(&g_vm_lock); t_lasterr = ERROR_INVALID_ADDRESS; return NULL; }
+        if (k >= g_nseg || g_seg[k].lo > p) { vm_unlock(); t_lasterr = ERROR_INVALID_ADDRESS; return NULL; }
         p = g_seg[k].hi;
     }
-    if (vm_mprotect(lo, hi, prot)) { pthread_mutex_unlock(&g_vm_lock); fail_errno(); return NULL; }
+    if (vm_mprotect(lo, hi, prot)) { vm_unlock(); fail_errno(); return NULL; }
     seg_set(lo, hi, base, MEM_COMMIT, prot, aprot);
     vm_sync(lo, hi);
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     return addr;
 }
 BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     uintptr_t a = (uintptr_t)addr;
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = seg_find(a);
-    if (i >= g_nseg || g_seg[i].lo > a) { pthread_mutex_unlock(&g_vm_lock); t_lasterr = ERROR_INVALID_ADDRESS; return FALSE; }
+    if (i >= g_nseg || g_seg[i].lo > a) { vm_unlock(); t_lasterr = ERROR_INVALID_ADDRESS; return FALSE; }
     if (type & MEM_RELEASE) {
         uintptr_t base = g_seg[i].alloc_base, hi = base;
         int k = seg_find(base);
@@ -1016,7 +1157,7 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
         seg_set(lo, hi, base, MEM_RESERVE, 0, aprot);
         vm_sync(lo, hi);
     }
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     return TRUE;
 }
 BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, DWORD *old) {
@@ -1026,15 +1167,15 @@ BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, DWORD *old) {
      * entry) take the execute right away from a code page. */
     MEMORY_BASIC_INFORMATION mi;
     DWORD untracked_old = VirtualQuery((void *)lo, &mi, sizeof mi) && mi.State == MEM_COMMIT ? mi.Protect : PAGE_READWRITE;
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = seg_find(lo);
     int tracked = i < g_nseg && g_seg[i].lo <= lo;
     if (old) *old = tracked ? g_seg[i].prot : untracked_old;
 #ifdef __APPLE__                                  /* memory we did not map: whole host pages (vm_sync does ours) */
     uintptr_t hlo = lo & ~(hpage() - 1), hhi = (hi + hpage() - 1) & ~(hpage() - 1);
-    if (!tracked && mprotect((void *)hlo, hhi - hlo, prot_posix(prot))) { pthread_mutex_unlock(&g_vm_lock); return fail_errno(); }
+    if (!tracked && mprotect((void *)hlo, hhi - hlo, prot_posix(prot))) { vm_unlock(); return fail_errno(); }
 #endif
-    if (vm_mprotect(lo, hi, prot)) { pthread_mutex_unlock(&g_vm_lock); return fail_errno(); }
+    if (vm_mprotect(lo, hi, prot)) { vm_unlock(); return fail_errno(); }
     if (tracked) {                                   /* per segment: keeps each one's allocation base */
         for (uintptr_t p = lo; p < hi;) {
             int k = seg_find(p);
@@ -1045,9 +1186,67 @@ BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, DWORD *old) {
         }
         vm_sync(lo, hi);
     }
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     return TRUE;
 }
+/* The rollback's learned-set save (rb_learned.c) makes hundreds of thousands of pages read-only and opens them one by one
+ * from its fault handler: the segment list would be split at every page (and its lock is no place for a fault handler).
+ * Those pages stay committed read-write in the bookkeeping, which is their state for everything but the first write. */
+int plat_protect_raw(void *p, size_t n, DWORD prot) {
+    uintptr_t lo = (uintptr_t)p & ~(uintptr_t)(PAGE - 1), hi = ((uintptr_t)p + n + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+    return mprotect((void *)lo, hi - lo, prot_posix(prot)) == 0;
+}
+/* AddVectoredExceptionHandler (Linux, x86-64): the handlers run from a SIGSEGV handler, newest "first" ones first; the
+ * stop signal of SuspendThread waits until the handler is done. When none continues, the SIGSEGV handler installed
+ * before (hostrt.c's crash report) runs as if it had been called by the kernel. */
+#if defined(__linux__) && defined(__x86_64__)
+typedef struct { int n; PVECTORED_EXCEPTION_HANDLER fn[]; } VehList;
+static VehList *g_veh;                                     /* replaced whole when one is added (the old list is kept) */
+static pthread_mutex_t g_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sigaction g_veh_old;
+static void veh_signal(int sig, siginfo_t *si, void *uc) {
+    const VehList *l = __atomic_load_n(&g_veh, __ATOMIC_ACQUIRE);
+    const greg_t *g = ((ucontext_t *)uc)->uc_mcontext.gregs;
+    EXCEPTION_RECORD r; CONTEXT c;
+    EXCEPTION_POINTERS e = {&r, &c};
+    memset(&r, 0, sizeof r);
+    r.ExceptionCode = EXCEPTION_ACCESS_VIOLATION; r.ExceptionAddress = (PVOID)(uintptr_t)g[REG_RIP]; r.NumberParameters = 2;
+    r.ExceptionInformation[0] = (g[REG_ERR] & 2) ? 1 : 0; r.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+    c.ContextFlags = CONTEXT_FULL; c.EFlags = (DWORD)g[REG_EFL];
+    c.Rax = g[REG_RAX]; c.Rcx = g[REG_RCX]; c.Rdx = g[REG_RDX]; c.Rbx = g[REG_RBX]; c.Rsp = g[REG_RSP]; c.Rbp = g[REG_RBP];
+    c.Rsi = g[REG_RSI]; c.Rdi = g[REG_RDI]; c.R8 = g[REG_R8]; c.R9 = g[REG_R9]; c.R10 = g[REG_R10]; c.R11 = g[REG_R11];
+    c.R12 = g[REG_R12]; c.R13 = g[REG_R13]; c.R14 = g[REG_R14]; c.R15 = g[REG_R15]; c.Rip = g[REG_RIP];
+    for (int i = 0; l && i < l->n; i++) if (l->fn[i](&e) == EXCEPTION_CONTINUE_EXECUTION) return;
+    if (g_veh_old.sa_flags & SA_SIGINFO) { if (g_veh_old.sa_sigaction) { g_veh_old.sa_sigaction(sig, si, uc); return; } }
+    else if (g_veh_old.sa_handler != SIG_DFL && g_veh_old.sa_handler != SIG_IGN) { g_veh_old.sa_handler(sig); return; }
+    signal(sig, SIG_DFL);                                  /* nobody else: the default action when the instruction runs again */
+}
+PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER fn) {
+    pthread_mutex_lock(&g_veh_lock);
+    VehList *o = g_veh, *l = malloc(sizeof *l + (size_t)((o ? o->n : 0) + 1) * sizeof fn);
+    if (!l) { pthread_mutex_unlock(&g_veh_lock); return NULL; }
+    l->n = 0;
+    if (first) l->fn[l->n++] = fn;
+    for (int i = 0; o && i < o->n; i++) l->fn[l->n++] = o->fn[i];
+    if (!first) l->fn[l->n++] = fn;
+    __atomic_store_n(&g_veh, l, __ATOMIC_RELEASE);
+    struct sigaction cur;
+    if (!sigaction(SIGSEGV, NULL, &cur) && cur.sa_sigaction != veh_signal) {      /* (again if someone took SIGSEGV since) */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        pthread_once(&g_sus_once, sus_install);
+        sa.sa_sigaction = veh_signal;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaddset(&sa.sa_mask, g_sus_sig);
+        sigaction(SIGSEGV, &sa, &g_veh_old);
+    }
+    pthread_mutex_unlock(&g_veh_lock);
+    return (PVOID)fn;
+}
+#else
+PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER fn) { (void)first; (void)fn; return NULL; }
+#endif
 static DWORD prot_from_maps(const char *perm) {
     int r = perm[0] == 'r', w = perm[1] == 'w', x = perm[2] == 'x';
     if (x) return w ? PAGE_EXECUTE_READWRITE : r ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
@@ -1060,19 +1259,19 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
     uintptr_t a = (uintptr_t)addr & ~(uintptr_t)(PAGE - 1);
     memset(mi, 0, sizeof *mi);
     mi->BaseAddress = (void *)a;
-    pthread_mutex_lock(&g_vm_lock);
+    vm_lock();
     int i = seg_find(a);
     if (i < g_nseg && g_seg[i].lo <= a) {
         Seg s = g_seg[i];
         uintptr_t hi = s.hi;
         for (int k = i + 1; k < g_nseg && g_seg[k].lo == hi && g_seg[k].alloc_base == s.alloc_base && g_seg[k].state == s.state && g_seg[k].prot == s.prot; k++) hi = g_seg[k].hi;
-        pthread_mutex_unlock(&g_vm_lock);
+        vm_unlock();
         mi->AllocationBase = (void *)s.alloc_base; mi->AllocationProtect = s.alloc_prot;
         mi->RegionSize = hi - a; mi->State = s.state; mi->Protect = s.state == MEM_COMMIT ? s.prot : 0; mi->Type = MEM_PRIVATE;
         return sizeof *mi;
     }
     uintptr_t next_tracked = i < g_nseg ? g_seg[i].lo : UINTPTR_MAX;
-    pthread_mutex_unlock(&g_vm_lock);
+    vm_unlock();
     if (a >= 0x800000000000ULL) return 0;
 #ifdef PROCMAP_QUERY
     /* Linux 6.11+: the mapping that holds a (or the next one) asked of the kernel directly. Reading and parsing the text
@@ -1206,6 +1405,12 @@ BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *m) {
     if (sysinfo(&s)) return FALSE;
     m->ullTotalPhys = (ULONGLONG)s.totalram * s.mem_unit;
     m->ullAvailPhys = (ULONGLONG)(s.freeram + s.bufferram) * s.mem_unit;
+    {   /* the kernel's own estimate (page cache that can be given back included): what the rollback's commit check needs */
+        FILE *f = fopen("/proc/meminfo", "r");
+        char line[128]; unsigned long long kb;
+        while (f && fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { m->ullAvailPhys = kb * 1024; break; }
+        if (f) fclose(f);
+    }
     m->ullTotalPageFile = m->ullTotalPhys + (ULONGLONG)s.totalswap * s.mem_unit;
     m->ullAvailPageFile = m->ullAvailPhys + (ULONGLONG)s.freeswap * s.mem_unit;
 #endif

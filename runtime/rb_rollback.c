@@ -314,7 +314,11 @@ static void rbg_step(Ctx *c) {
         if (g_rbt) { r1_host_stack_note((uint64_t)(uintptr_t)g_rbt_stk, (uint64_t)(uintptr_t)g_rbt_stk + (1u << 20));
             LOG("r1: RB NET TEST_STK: H2 runs on a host stack at %p..%p (inside window 2)\n", (void *)g_rbt_stk, (void *)(g_rbt_stk + (1u << 20))); }
     }
+#ifndef _WIN32                                          /* (the test switches the TEB's stack limits with it: Windows only) */
+    if (g_rbt) { g_rbt = 0; LOG("r1: RB NET TEST_STK: Windows only: off\n"); }
+#endif
     if (!g_rbt) { rbg_step_body(c); return; }
+#ifdef _WIN32
     g_rbt_c = c;
     NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); void *ob = tib->StackBase, *ol = tib->StackLimit;
     uint8_t *top = g_rbt_stk + (1u << 20) - 256;
@@ -327,6 +331,7 @@ static void rbg_step(Ctx *c) {
                      : : "r"(top), "r"(rbt_body)
                      : "rbx", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory");
     tib->StackBase = ob; tib->StackLimit = ol;
+#endif
 }
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
 static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
