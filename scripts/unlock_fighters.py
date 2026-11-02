@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Unlock every base-game fighter in the Linux build's save, without earning them.
+"""Unlock every base-game fighter in the save, without earning them (Windows, Linux, macOS builds).
 
-    deps/venv/bin/python scripts/linux/unlock_fighters.py [--save <system_data.bin>] [--dry-run]
+    Windows:  deps\\python\\python.exe scripts\\unlock_fighters.py [--save <system_data.bin>] [--dry-run]
+    Linux:    deps/venv/bin/python scripts/unlock_fighters.py [...]
+    macOS:    python3 scripts/unlock_fighters.py [...]
 
-The save is by default ~/.local/share/ssbu-recomp/userdata/save/save_data/system_data.bin (play.sh's). Layout from
+Close the game first. The save is by default <userdata>/save/save_data/system_data.bin, <userdata> being where Play SSBU.bat
+/ play.sh / run.py keep it: Windows <build folder>\\saves (build_location.txt, else <repo>\\build), Linux
+~/.local/share/ssbu-recomp/userdata, macOS ~/Library/Application Support/ssbu-recomp/userdata. Layout from
 WindowSmash's tools/unlock_all.py (github.com/SNO2207/WindowSmash, found on 11.0.0 and checked on 13.0.5); the same
 tables were checked by hand on a 13.0.4 save (2026-10-21). Two tables, indexed by each fighter's save_no from
-ui_chara_db.prc (0 Mario ... 73 Mii Gunner; 74-85 the DLC fighters, unlocked by build-linux/config/dlc.txt, not touched):
+ui_chara_db.prc (0 Mario ... 73 Mii Gunner; 74-85 the DLC fighters, unlocked by config/dlc.txt, not touched):
   FLAGS    8 bytes per fighter: [0] 1 = selectable, [1..3] challenger state, [4] the order fighters were first met
   RECORDS  the "joined the battle" milestone, 8 bytes: bits 0-11 year, 12-15 month, 16-20 day, 21-25 hour,
            26-31 minute, 32-37 second, 48-55 how (3), 63 set
 A locked fighter gets what the game writes when one joins: the flag, the challenger state cleared, the next order number
-and a milestone dated now (shown once at the next boot). A copy of the save goes to save_backups/ first.
+and a milestone dated now (shown once at the next boot). A copy of the save goes first to save_backups, next to the
+userdata folder (Windows <build folder>\\save_backups). Standard library only: the file also works on its own, with --save.
 """
 import argparse
 import datetime
@@ -19,9 +24,9 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 
-DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ssbu-recomp')
-SAVE = os.path.join(DATA, 'userdata', 'save', 'save_data', 'system_data.bin')
+HERE = os.path.dirname(os.path.abspath(__file__))
 SAVE_SIZE, FORMAT = 0x5B4AF8, 0x1B
 VERSIONS = {0xB000: '11.0.0', 0xD004: '13.0.4', 0xD005: '13.0.5'}   # offset 8: the game version that last wrote the save
 FLAGS, RECORDS = 0x53FF40, 0x54FEA8
@@ -43,12 +48,37 @@ def record(t):
             | HOW << 48 | 1 << 63)
 
 
+def userdata():
+    if sys.platform == 'win32':
+        try:
+            sys.path.insert(0, HERE)
+            import build_location        # scripts/build_location.py: build_location.txt, else <repo>\\build
+            build = build_location.get()
+        except ImportError:              # the file on its own, outside the repository
+            build = os.path.join(os.path.dirname(HERE), 'build')
+        return os.path.join(build, 'saves')
+    if sys.platform == 'darwin':
+        return os.path.expanduser('~/Library/Application Support/ssbu-recomp/userdata')
+    return os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ssbu-recomp', 'userdata')
+
+
+def game_running():
+    if sys.platform == 'win32':
+        r = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq ssbu_native.exe', '/NH'], capture_output=True, text=True,
+                           errors='replace')
+        return 'ssbu_native.exe' in r.stdout.lower()
+    try:
+        return subprocess.run(['pgrep', '-x', 'ssbu_native'], capture_output=True).returncode == 0
+    except FileNotFoundError:            # no pgrep: cannot tell
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--save', default=SAVE, help='the save to change (default: %(default)s)')
+    ap.add_argument('--save', default=os.path.join(userdata(), 'save', 'save_data', 'system_data.bin'), help='the save to change (default: %(default)s)')
     ap.add_argument('--dry-run', action='store_true', help='list what would be unlocked, change nothing')
     a = ap.parse_args()
-    if subprocess.run(['pgrep', '-x', 'ssbu_native'], capture_output=True).returncode == 0:
+    if game_running():
         raise SystemExit('the game is running: close it first (it writes its save from memory and would undo this)')
     if not os.path.isfile(a.save):
         raise SystemExit('no save at %s: start the game once, reach the main menu, close it, then run this again' % a.save)
@@ -85,7 +115,9 @@ def main():
     print('%s %d: %s' % ('would unlock' if a.dry_run else 'unlocking', len(added), ', '.join(added)))
     if a.dry_run:
         return
-    backups = os.path.join(DATA, 'save_backups')
+    # <userdata>/save/save_data/system_data.bin -> save_backups beside <userdata>
+    backups = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(a.save))))),
+                           'save_backups')
     os.makedirs(backups, exist_ok=True)
     backup = os.path.join(backups, 'system_data.bin.before-unlock-' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     shutil.copy2(a.save, backup)
